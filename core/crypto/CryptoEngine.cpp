@@ -72,10 +72,10 @@ std::vector<uint8_t> CryptoEngine::decrypt(std::span<const uint8_t> data) {
 //   STATIC METHODS FOR HANDSHAKE (Curve25519)
 
 void CryptoEngine::generate_ecdh_keys(std::vector<uint8_t>& priv_out, std::vector<uint8_t>& pub_out) {
-    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, nullptr);
     if (!ctx) throw std::runtime_error("EVP_PKEY_CTX_new_id failed");
 
-    EVP_PKEY* pkey = NULL;
+    EVP_PKEY* pkey = nullptr;
     if (EVP_PKEY_keygen_init(ctx) <= 0) throw std::runtime_error("Keygen init failed");
     if (EVP_PKEY_keygen(ctx, &pkey) <= 0) throw std::runtime_error("Keygen failed");
 
@@ -92,17 +92,17 @@ void CryptoEngine::generate_ecdh_keys(std::vector<uint8_t>& priv_out, std::vecto
 
 std::vector<uint8_t> CryptoEngine::derive_shared_secret(const std::vector<uint8_t>& my_priv,
                                                        const std::vector<uint8_t>& peer_pub) {
-    EVP_PKEY* priv_key = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, my_priv.data(), 32);
-    EVP_PKEY* peer_key = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, peer_pub.data(), 32);
+    EVP_PKEY* priv_key = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, nullptr, my_priv.data(), 32);
+    EVP_PKEY* peer_key = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, nullptr, peer_pub.data(), 32);
 
     if (!priv_key || !peer_key) throw std::runtime_error("Failed to load raw keys");
 
-    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(priv_key, NULL);
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(priv_key, nullptr);
     EVP_PKEY_derive_init(ctx);
     EVP_PKEY_derive_set_peer(ctx, peer_key);
 
     size_t secret_len;
-    EVP_PKEY_derive(ctx, NULL, &secret_len);
+    EVP_PKEY_derive(ctx, nullptr, &secret_len);
     std::vector<uint8_t> secret(secret_len);
     EVP_PKEY_derive(ctx, secret.data(), &secret_len);
 
