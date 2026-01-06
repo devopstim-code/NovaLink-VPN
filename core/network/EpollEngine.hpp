@@ -24,6 +24,7 @@ struct EventContext {
 
 class EpollEngine {
 public:
+
     static constexpr int DEFAULT_MAX_EVENTS = 128;
 
     EpollEngine();

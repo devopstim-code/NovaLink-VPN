@@ -22,13 +22,13 @@
 #include <cstring>
 #include <unordered_map>
 #include <chrono>
+#include <utility> // Для std::to_underlying
 #include <arpa/inet.h>
 
 namespace {
     std::atomic<bool> global_running{true};
 }
 
-//Using [[maybe_unused]] for system parameters
 void signal_handler([[maybe_unused]] int sig) {
     global_running.store(false);
 }
@@ -38,10 +38,8 @@ enum class PacketType : uint8_t {
     Data      = 0x02
 };
 
-// Making the argument const NetAddress& for optimization
 std::string address_to_key(const NetAddress& addr) {
     char ip_str[INET_ADDRSTRLEN];
-    // Use reinterpret_cast instead of C-style cast
     auto* saddr = reinterpret_cast<const struct sockaddr_in*>(&addr.storage);
     inet_ntop(AF_INET, &(saddr->sin_addr), ip_str, INET_ADDRSTRLEN);
     return std::string(ip_str) + ":" + std::to_string(ntohs(saddr->sin_port));
@@ -54,37 +52,43 @@ struct ClientSession {
     std::chrono::steady_clock::time_point last_seen;
 };
 
-    // Helper function to reduce the complexity of main
-void handle_client_handshake(
-    const uint8_t* buf, ssize_t len, const NetAddress& sender,
-    const std::vector<uint8_t>& srv_priv, const std::vector<uint8_t>& srv_pub,
-    UdpSocket* udp,
-    std::unordered_map<std::string, std::shared_ptr<ClientSession>>& sessions,
-    std::unordered_map<uint32_t, std::shared_ptr<ClientSession>>& route_table)
-{
-    if (len < 37) return;
+// SonarCloud: Группируем параметры в структуру, чтобы их не было больше 7
+struct HandshakeContext {
+    const uint8_t* buf;
+    ssize_t len;
+    const NetAddress& sender;
+    const std::vector<uint8_t>& srv_priv;
+    const std::vector<uint8_t>& srv_pub;
+    UdpSocket* udp;
+    std::unordered_map<std::string, std::shared_ptr<ClientSession>>& sessions;
+    std::unordered_map<uint32_t, std::shared_ptr<ClientSession>>& route_table;
+};
 
-    auto client_pub = std::vector(buf + 1, buf + 33);
+void handle_client_handshake(HandshakeContext ctx) {
+    if (ctx.len < 37) return;
+
+    auto client_pub = std::vector(ctx.buf + 1, ctx.buf + 33);
     uint32_t requested_ip;
-    std::memcpy(&requested_ip, buf + 33, 4);
+    std::memcpy(&requested_ip, ctx.buf + 33, 4);
 
-    auto shared = CryptoEngine::derive_shared_secret(srv_priv, client_pub);
+    auto shared = CryptoEngine::derive_shared_secret(ctx.srv_priv, client_pub);
     auto session = std::make_shared<ClientSession>();
     session->crypto = std::make_unique<CryptoEngine>(shared);
-    session->address = sender;
+    session->address = ctx.sender;
     session->internal_ip = requested_ip;
     session->last_seen = std::chrono::steady_clock::now();
 
-    sessions[address_to_key(sender)] = session;
-    route_table[requested_ip] = session;
+    ctx.sessions[address_to_key(ctx.sender)] = session;
+    ctx.route_table[requested_ip] = session;
 
-    std::vector answer = { static_cast<uint8_t>(PacketType::Handshake) };
-    answer.insert(answer.end(), srv_pub.begin(), srv_pub.end());
-    udp->send(answer, sender);
+    // SonarCloud: Используем std::to_underlying
+    std::vector answer = { std::to_underlying(PacketType::Handshake) };
+    answer.insert(answer.end(), ctx.srv_pub.begin(), ctx.srv_pub.end());
+    ctx.udp->send(answer, ctx.sender);
 
     struct in_addr addr_struct;
     addr_struct.s_addr = requested_ip;
-    std::cout << "[Handshake] Registered " << address_to_key(sender)
+    std::cout << "[Handshake] Registered " << address_to_key(ctx.sender)
               << " as " << inet_ntoa(addr_struct) << std::endl;
 }
 
@@ -111,7 +115,9 @@ int main(int argc, char* argv[]) {
         CryptoEngine::generate_ecdh_keys(srv_priv, srv_pub);
 
         tun->up("10.8.0.1", "255.255.255.0");
-        if (system("ip link set dev nova_srv mtu 1400") != 0) {
+
+        // SonarCloud: Init-statement в if для mtu_cmd
+        if (const std::string mtu_cmd = "ip link set dev nova_srv mtu 1400"; system(mtu_cmd.c_str()) != 0) {
             std::cerr << "[Error] Failed to set MTU" << std::endl;
         }
 
@@ -135,10 +141,10 @@ int main(int argc, char* argv[]) {
                     ssize_t len = udp->receive(buf, sender);
                     if (len <= 0) continue;
 
-                    if (buf[0] == static_cast<uint8_t>(PacketType::Handshake)) {
-                        handle_client_handshake(buf, len, sender, srv_priv, srv_pub, udp.get(), sessions, route_table);
+                    if (buf[0] == std::to_underlying(PacketType::Handshake)) {
+                        handle_client_handshake({buf, len, sender, srv_priv, srv_pub, udp.get(), sessions, route_table});
                     }
-                    else if (buf[0] == static_cast<uint8_t>(PacketType::Data)) {
+                    else if (buf[0] == std::to_underlying(PacketType::Data)) {
                         auto it = sessions.find(address_to_key(sender));
                         if (it != sessions.end()) {
                             auto decrypted = it->second->crypto->decrypt({buf + 1, static_cast<size_t>(len - 1)});
@@ -157,7 +163,7 @@ int main(int argc, char* argv[]) {
                         auto it = route_table.find(dest_ip);
                         if (it != route_table.end()) {
                             auto encrypted = it->second->crypto->encrypt(packet);
-                            std::vector<uint8_t> final_pkt = { static_cast<uint8_t>(PacketType::Data) };
+                            std::vector final_pkt = { std::to_underlying(PacketType::Data) };
                             final_pkt.insert(final_pkt.end(), encrypted.begin(), encrypted.end());
                             udp->send(final_pkt, it->second->address);
                         }

@@ -47,25 +47,21 @@ You'll need `cmake` and a compiler that supports C++20 (like GCC 10+ or Clang).
 mkdir build && cd build
 cmake ..
 make -j$(nproc)
-
+```
 
 Run it
 
 Since we're touching network interfaces (TUN), you'll need sudo.
 
 1. Fire up the Server:
-Bash
+```Bash
 
 sudo ./bin/novalink_server 55555
-
+```
 2. Connect the Client:
-Bash
+```Bash
 
 # Format: ./client <server_ip> <port> <virtual_ip>
 sudo ./bin/novalink_client 127.0.0.1 55555 10.8.0.3
-
-📜 License
-
-MIT. Feel free to fork it, break it, or use it in your own stuff.
-
+```
 <div align="center"> <sub>Made by a dev who cares about performance.</sub> </div>

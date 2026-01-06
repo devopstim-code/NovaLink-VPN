@@ -2,8 +2,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-EpollEngine::EpollEngine() {
-    _epoll_fd = epoll_create1(0);
+EpollEngine::EpollEngine()
+    : _epoll_fd(epoll_create1(0)),
+      _running(true) // Initialize here
+{
     if (_epoll_fd == -1) {
         throw std::system_error(errno, std::generic_category(), "Failed to create epoll");
     }
