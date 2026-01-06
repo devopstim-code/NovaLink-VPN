@@ -21,7 +21,9 @@
 #include <chrono>
 #include <arpa/inet.h>
 
-std::atomic<bool> global_running{true};
+namespace {
+    std::atomic<bool> global_running{true};
+}
 void signal_handler(int sig) { global_running.store(false); }
 
 enum PacketType : uint8_t {

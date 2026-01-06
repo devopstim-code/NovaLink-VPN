@@ -43,7 +43,7 @@ void EpollEngine::modify(int fd, uint32_t events, EventContext* ctx) {
 }
 
 void EpollEngine::remove(int fd) {
-    if (epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, fd, nullptr) == -1 && errno != ENOENT) {
+    if (epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, fd, nullptrptr) == -1 && errno != ENOENT) {
         throw std::system_error(errno, std::system_category(), "epoll_ctl DEL failed");
     }
 }
