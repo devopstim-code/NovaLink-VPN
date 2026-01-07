@@ -9,47 +9,51 @@
 * * Copyright (c) 2025-2026 Devopstim. All rights reserved.
  *********************************************************************/
 #pragma once
+
 #include <vector>
 #include <span>
 #include <string>
 #include <stdexcept>
-#include <openssl/evp.h>
+#include <cstddef>
 
+
+struct evp_cipher_ctx_st;
+using EVP_CIPHER_CTX = struct evp_cipher_ctx_st;
 
 class CryptoException : public std::runtime_error {
 public:
- using std::runtime_error::runtime_error;
+    using std::runtime_error::runtime_error;
 };
 
-class CryptoEngine {
+class CryptoEngine final {
 public:
- static constexpr size_t KEY_SIZE = 32;
- static constexpr size_t IV_SIZE = 12;
- static constexpr size_t TAG_SIZE = 16;
- static constexpr size_t TARGET_PACKET_SIZE = 1400;
+    static constexpr size_t KEY_SIZE = 32;
+    static constexpr size_t IV_SIZE = 12;
+    static constexpr size_t TAG_SIZE = 16;
+    static constexpr size_t TARGET_PACKET_SIZE = 1400;
 
- explicit CryptoEngine(const std::vector<uint8_t>& key);
- ~CryptoEngine();
+    explicit CryptoEngine(const std::vector<std::byte>& key);
+    ~CryptoEngine();
+    CryptoEngine(const CryptoEngine&) = delete;
+    CryptoEngine& operator=(const CryptoEngine&) = delete;
+    CryptoEngine(CryptoEngine&& other) noexcept;
+    CryptoEngine& operator=(CryptoEngine&& other) noexcept;
 
- // Disable copying to protect keys in memory
- CryptoEngine(const CryptoEngine&) = delete;
- CryptoEngine& operator=(const CryptoEngine&) = delete;
- CryptoEngine(CryptoEngine&& other) noexcept;
- CryptoEngine& operator=(CryptoEngine&& other) noexcept;
+    static void generate_ecdh_keys(std::vector<std::byte>& priv_out, std::vector<std::byte>& pub_out);
+    static std::vector<std::byte> derive_shared_secret(const std::vector<std::byte>& my_priv,
+                                                      const std::vector<std::byte>& peer_pub);
 
- static void generate_ecdh_keys(std::vector<uint8_t>& priv_out, std::vector<uint8_t>& pub_out);
- static std::vector<uint8_t> derive_shared_secret(const std::vector<uint8_t>& my_priv,
-                                                 const std::vector<uint8_t>& peer_pub);
-
- // External methods (now they do encryption + obfuscation)
- std::vector<uint8_t> encrypt(std::span<const uint8_t> plaintext);
- std::vector<uint8_t> decrypt(std::span<const uint8_t> ciphertext);
+    [[nodiscard]] std::vector<std::byte> encrypt(std::span<const std::byte> plaintext);
+    [[nodiscard]] std::vector<std::byte> decrypt(std::span<const std::byte> ciphertext);
 
 private:
- // Internal methods (pure OpenSSL encryption only)
- std::vector<uint8_t> encrypt_internal(std::span<const uint8_t> plaintext);
- std::vector<uint8_t> decrypt_internal(std::span<const uint8_t> ciphertext);
+    [[nodiscard]] std::vector<std::byte> encrypt_internal(std::span<const std::byte> plaintext);
 
- std::vector<uint8_t> _key;
- EVP_CIPHER_CTX* _ctx;
+    int EVP_DecryptFinal_ex(unsigned char * ctx, int * outm);
+
+    [[nodiscard]] std::vector<std::byte> decrypt_internal(std::span<const std::byte> ciphertext);
+
+    std::vector<std::byte> _key;
+
+    EVP_CIPHER_CTX* _ctx = nullptr;
 };

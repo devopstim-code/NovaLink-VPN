@@ -12,29 +12,24 @@
 #include "NetAddress.hpp"
 #include <span>
 #include <system_error>
+#include <cstddef>
 
-class UdpSocket {
+class UdpSocket final {
 public:
-    // Buffer support up to 2KB (enough for standard MTU 1500 + headers)
     static constexpr size_t MAX_PACKET_SIZE = 2048;
 
     explicit UdpSocket(int family = AF_INET);
     ~UdpSocket();
-
     UdpSocket(const UdpSocket&) = delete;
     UdpSocket& operator=(const UdpSocket&) = delete;
     UdpSocket(UdpSocket&& other) noexcept;
     UdpSocket& operator=(UdpSocket&& other) noexcept;
-
     void bind(uint16_t port, bool ipv6 = false);
 
-    // Return ssize_t to understand the size of the transferred data
-    ssize_t send(std::span<const uint8_t> data, const NetAddress& target);
-    ssize_t receive(std::span<uint8_t> buffer, NetAddress& out_sender);
-
-    int get_fd() const noexcept { return _fd; }
+    [[nodiscard]] ssize_t send(std::span<const std::byte> data, const NetAddress& target) const;
+    [[nodiscard]] ssize_t receive(std::span<std::byte> buffer, NetAddress& out_sender) const;
+    [[nodiscard]] int get_fd() const noexcept { return _fd; }
 
 private:
     int _fd{-1};
-    void set_nonblocking();
 };

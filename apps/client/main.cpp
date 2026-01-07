@@ -19,16 +19,19 @@
 #include <atomic>
 #include <memory>
 #include <chrono>
-#include <utility>
 #include <format>
 #include <arpa/inet.h>
+#include <cstring>
+#include <utility>
+
+#include "core/network/SslLayer.hpp"
 
 namespace {
-    std::atomic<bool> global_running{true};
+    const std::atomic<bool> global_running{true};
 }
 
 void handle_signal([[maybe_unused]] int sig) {
-    global_running.store(false);
+    const_cast<std::atomic<bool>&>(global_running).store(false);
 }
 
 enum class PacketType : uint8_t {
@@ -42,54 +45,75 @@ struct ClientContext {
     const NetAddress& server_addr;
     std::unique_ptr<CryptoEngine>& crypto;
     bool& handshaked;
-    const std::vector<uint8_t>& my_priv;
-    const std::vector<uint8_t>& my_pub;
+    const std::vector<std::byte>& my_priv;
+    const std::vector<std::byte>& my_pub;
 };
-
 void send_handshake(const ClientContext& ctx, const std::string& v_ip_str) {
-    std::vector hello = { std::to_underlying(PacketType::Handshake) };
+    std::vector<std::byte> hello;
+    hello.push_back(static_cast<std::byte>(PacketType::Handshake));
     hello.insert(hello.end(), ctx.my_pub.begin(), ctx.my_pub.end());
 
     uint32_t my_v_ip;
     if (inet_pton(AF_INET, v_ip_str.c_str(), &my_v_ip) <= 0) return;
-    const auto* ip_bytes = static_cast<const uint8_t*>(static_cast<const void*>(&my_v_ip));
-    hello.insert(hello.end(), ip_bytes, ip_bytes + 4);
+    const auto* ip_bytes = reinterpret_cast<const std::byte*>(&my_v_ip);
+    hello.insert(hello.end(), ip_bytes, ip_bytes + sizeof(my_v_ip));
 
-    ctx.udp.send(hello, ctx.server_addr);
-    std::cout << "[Handshake] Sending public key + IP..." << std::endl;
+    // МАСКИРОВКА: Оборачиваем пакет в TLS заголовок
+    auto ssl_pkt = SslLayer::wrap(hello, SslLayer::RECORD_HANDSHAKE);
+
+    if (ctx.udp.send(ssl_pkt, ctx.server_addr) < 0) {
+        std::cerr << "[Handshake] Failed to send packet" << std::endl;
+    } else {
+        std::cout << "[Handshake] Sending public key + IP (SSL masked)..." << std::endl;
+    }
 }
 
 void handle_udp_event(ClientContext& ctx) {
-    uint8_t buf[4096];
+    std::byte buf[4096];
     NetAddress sender;
     ssize_t len = ctx.udp.receive(buf, sender);
     if (len <= 0) return;
 
-    if (buf[0] == std::to_underlying(PacketType::Handshake) && !ctx.handshaked) {
-        if (len < 33) return;
-        std::vector<uint8_t> srv_pub(buf + 1, buf + 33);
+    // ДЕМАСКИРОВКА: Проверяем TLS заголовок и достаем полезную нагрузку
+    auto raw_data = SslLayer::unwrap(std::span{buf, static_cast<size_t>(len)});
+    if (raw_data.empty()) return; // Пакет не прошел проверку TLS-маскировки
+
+    const auto p_type = static_cast<uint8_t>(raw_data[0]);
+
+    if (p_type == std::to_underlying(PacketType::Handshake) && !ctx.handshaked) {
+        if (raw_data.size() < 33) return;
+
+        std::vector<std::byte> srv_pub(32);
+        std::memcpy(srv_pub.data(), raw_data.data() + 1, 32);
+
         auto shared = CryptoEngine::derive_shared_secret(ctx.my_priv, srv_pub);
         ctx.crypto = std::make_unique<CryptoEngine>(shared);
         ctx.handshaked = true;
         std::cout << "[Handshake] SUCCESS! Encryption established." << std::endl;
     }
-    else if (buf[0] == std::to_underlying(PacketType::Data) && ctx.handshaked) {
-        // Здесь CryptoEngine::decrypt сам отрежет мусор (Padding), так как мы обновили его вчера
-        auto decrypted = ctx.crypto->decrypt({buf + 1, static_cast<size_t>(len - 1)});
+    else if (p_type == std::to_underlying(PacketType::Data) && ctx.handshaked) {
+        // Убираем 1 байт PacketType::Data и расшифровываем
+        auto decrypted = ctx.crypto->decrypt(raw_data.subspan(1));
         ctx.tun.write_packet(decrypted);
     }
 }
 
-//CryptoEngine::encrypt will automatically add garbage up to 1400 bytes
 void handle_tun_event(ClientContext& ctx) {
-    ctx.tun.read_all_packets([&ctx](std::span<const uint8_t> packet) {
+    ctx.tun.read_all_packets([&ctx](std::span<const std::byte> packet) {
+        if (!ctx.crypto) return;
+
         auto encrypted = ctx.crypto->encrypt(packet);
-        std::vector final_pkt = { std::to_underlying(PacketType::Data) };
+
+        std::vector<std::byte> final_pkt;
+        final_pkt.reserve(encrypted.size() + 1);
+        final_pkt.push_back(static_cast<std::byte>(PacketType::Data));
         final_pkt.insert(final_pkt.end(), encrypted.begin(), encrypted.end());
-        ctx.udp.send(final_pkt, ctx.server_addr);
+
+        // МАСКИРОВКА: Весь зашифрованный пакет теперь выглядит как TLS Application Data
+        auto ssl_pkt = SslLayer::wrap(final_pkt, SslLayer::RECORD_APPLICATION_DATA);
+        (void)ctx.udp.send(ssl_pkt, ctx.server_addr);
     });
 }
-
 int main(int argc, char* argv[]) {
     if (argc < 4) {
         std::cerr << std::format("Usage: {} <server_ip> <port> <virtual_ip>\n", argv[0]);
@@ -107,16 +131,13 @@ int main(int argc, char* argv[]) {
         auto udp = std::make_unique<UdpSocket>(AF_INET);
         NetAddress server_addr(argv[1], static_cast<uint16_t>(std::stoi(argv[2])));
 
-        std::vector<uint8_t> my_priv, my_pub;
+        std::vector<std::byte> my_priv, my_pub;
         CryptoEngine::generate_ecdh_keys(my_priv, my_pub);
 
         std::unique_ptr<CryptoEngine> crypto;
         bool handshaked = false;
 
         tun->up(v_ip_str, "255.255.255.0");
-        if (const std::string mtu_cmd = std::format("ip link set dev {} mtu 1400", if_name); system(mtu_cmd.c_str()) != 0) {
-             std::cerr << "[Warning] Failed to set MTU" << std::endl;
-        }
 
         EpollEngine engine;
         EventContext tun_ctx{tun->get_fd(), tun.get(), 0};
@@ -131,19 +152,19 @@ int main(int argc, char* argv[]) {
         auto last_hello = std::chrono::steady_clock::now();
 
         while (global_running.load()) {
-            if (auto now = std::chrono::steady_clock::now();
-                !handshaked && std::chrono::duration_cast<std::chrono::seconds>(now - last_hello).count() >= 2) {
+            auto now = std::chrono::steady_clock::now();
+            if (!handshaked && std::chrono::duration_cast<std::chrono::seconds>(now - last_hello).count() >= 2) {
                 send_handshake(c_ctx, v_ip_str);
                 last_hello = now;
             }
 
             int nfds = engine.wait(event_buffer, 100);
             for (int n = 0; n < nfds; ++n) {
-                const auto* ctx = static_cast<const EventContext*>(event_buffer[n].data.ptr);
-                if (ctx->fd == udp->get_fd()) {
+                const auto* event_ctx = static_cast<const EventContext*>(event_buffer[n].data.ptr);
+                if (event_ctx->fd == udp->get_fd()) {
                     handle_udp_event(c_ctx);
                 }
-                else if (ctx->fd == tun->get_fd() && handshaked) {
+                else if (event_ctx->fd == tun->get_fd() && handshaked) {
                     handle_tun_event(c_ctx);
                 }
             }
