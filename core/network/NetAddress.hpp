@@ -6,7 +6,6 @@
 #include <stdexcept>
 #include <format>
 
-// Sonar: Define a dedicated exception
 class NetworkException : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -38,7 +37,6 @@ struct NetAddress {
         }
     }
 
-    // Sonar: Safer operation instead of direct reinterpret_cast
     sockaddr_in* get_sin() {
         return static_cast<sockaddr_in*>(static_cast<void*>(&storage));
     }

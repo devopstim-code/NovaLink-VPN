@@ -73,10 +73,8 @@ void handle_udp_event(ClientContext& ctx) {
     NetAddress sender;
     ssize_t len = ctx.udp.receive(buf, sender);
     if (len <= 0) return;
-
-    // ДЕМАСКИРОВКА: Проверяем TLS заголовок и достаем полезную нагрузку
     auto raw_data = SslLayer::unwrap(std::span{buf, static_cast<size_t>(len)});
-    if (raw_data.empty()) return; // Пакет не прошел проверку TLS-маскировки
+    if (raw_data.empty()) return;
 
     const auto p_type = static_cast<uint8_t>(raw_data[0]);
 
@@ -92,7 +90,6 @@ void handle_udp_event(ClientContext& ctx) {
         std::cout << "[Handshake] SUCCESS! Encryption established." << std::endl;
     }
     else if (p_type == std::to_underlying(PacketType::Data) && ctx.handshaked) {
-        // Убираем 1 байт PacketType::Data и расшифровываем
         auto decrypted = ctx.crypto->decrypt(raw_data.subspan(1));
         ctx.tun.write_packet(decrypted);
     }
@@ -109,7 +106,6 @@ void handle_tun_event(ClientContext& ctx) {
         final_pkt.push_back(static_cast<std::byte>(PacketType::Data));
         final_pkt.insert(final_pkt.end(), encrypted.begin(), encrypted.end());
 
-        // МАСКИРОВКА: Весь зашифрованный пакет теперь выглядит как TLS Application Data
         auto ssl_pkt = SslLayer::wrap(final_pkt, SslLayer::RECORD_APPLICATION_DATA);
         (void)ctx.udp.send(ssl_pkt, ctx.server_addr);
     });

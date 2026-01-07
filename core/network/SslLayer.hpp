@@ -6,7 +6,6 @@
 
 class SslLayer {
 public:
-    // TLS Record Types
     static constexpr uint8_t RECORD_HANDSHAKE = 0x16;
     static constexpr uint8_t RECORD_APPLICATION_DATA = 0x17;
     static std::vector<std::byte> wrap(std::span<const std::byte> data, uint8_t type = RECORD_APPLICATION_DATA);
