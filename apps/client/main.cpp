@@ -8,7 +8,6 @@
 * \project NovaLink Vpn
 * * Copyright (c) 2025-2026 Devopstim. All rights reserved.
  *********************************************************************/
-
 #include "core/network/EpollEngine.hpp"
 #include "core/network/UdpSocket.hpp"
 #include "core/tunnel/TunDevice.hpp"
@@ -21,6 +20,7 @@
 #include <memory>
 #include <chrono>
 #include <utility>
+#include <format>
 #include <arpa/inet.h>
 
 namespace {
@@ -36,23 +36,63 @@ enum class PacketType : uint8_t {
     Data      = 0x02
 };
 
-void send_handshake(UdpSocket* udp, const NetAddress& server_addr, const std::vector<uint8_t>& my_pub, const std::string& v_ip_str) {
-    // Sonar: std::to_underlying (C++23) вместо static_cast
+struct ClientContext {
+    UdpSocket& udp;
+    TunDevice& tun;
+    const NetAddress& server_addr;
+    std::unique_ptr<CryptoEngine>& crypto;
+    bool& handshaked;
+    const std::vector<uint8_t>& my_priv;
+    const std::vector<uint8_t>& my_pub;
+};
+
+void send_handshake(const ClientContext& ctx, const std::string& v_ip_str) {
     std::vector hello = { std::to_underlying(PacketType::Handshake) };
-    hello.insert(hello.end(), my_pub.begin(), my_pub.end());
+    hello.insert(hello.end(), ctx.my_pub.begin(), ctx.my_pub.end());
 
-    uint32_t my_v_ip = inet_addr(v_ip_str.c_str());
-    // Sonar: Используем reinterpret_cast аккуратно (указатель на байты)
-    auto* ip_ptr = reinterpret_cast<uint8_t*>(&my_v_ip);
-    hello.insert(hello.end(), ip_ptr, ip_ptr + 4);
+    uint32_t my_v_ip;
+    if (inet_pton(AF_INET, v_ip_str.c_str(), &my_v_ip) <= 0) return;
+    const auto* ip_bytes = static_cast<const uint8_t*>(static_cast<const void*>(&my_v_ip));
+    hello.insert(hello.end(), ip_bytes, ip_bytes + 4);
 
-    udp->send(hello, server_addr);
+    ctx.udp.send(hello, ctx.server_addr);
     std::cout << "[Handshake] Sending public key + IP..." << std::endl;
+}
+
+void handle_udp_event(ClientContext& ctx) {
+    uint8_t buf[4096];
+    NetAddress sender;
+    ssize_t len = ctx.udp.receive(buf, sender);
+    if (len <= 0) return;
+
+    if (buf[0] == std::to_underlying(PacketType::Handshake) && !ctx.handshaked) {
+        if (len < 33) return;
+        std::vector<uint8_t> srv_pub(buf + 1, buf + 33);
+        auto shared = CryptoEngine::derive_shared_secret(ctx.my_priv, srv_pub);
+        ctx.crypto = std::make_unique<CryptoEngine>(shared);
+        ctx.handshaked = true;
+        std::cout << "[Handshake] SUCCESS! Encryption established." << std::endl;
+    }
+    else if (buf[0] == std::to_underlying(PacketType::Data) && ctx.handshaked) {
+        // Здесь CryptoEngine::decrypt сам отрежет мусор (Padding), так как мы обновили его вчера
+        auto decrypted = ctx.crypto->decrypt({buf + 1, static_cast<size_t>(len - 1)});
+        ctx.tun.write_packet(decrypted);
+    }
+}
+
+//CryptoEngine::encrypt will automatically add garbage up to 1400 bytes
+void handle_tun_event(ClientContext& ctx) {
+    ctx.tun.read_all_packets([&ctx](std::span<const uint8_t> packet) {
+        auto encrypted = ctx.crypto->encrypt(packet);
+        std::vector final_pkt = { std::to_underlying(PacketType::Data) };
+        final_pkt.insert(final_pkt.end(), encrypted.begin(), encrypted.end());
+        ctx.udp.send(final_pkt, ctx.server_addr);
+    });
 }
 
 int main(int argc, char* argv[]) {
     if (argc < 4) {
-        std::cerr << "Usage: " << argv[0] << " <server_ip> <port> <virtual_ip>" << std::endl;
+        std::cerr << std::format("Usage: {} <server_ip> <port> <virtual_ip>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -60,26 +100,21 @@ int main(int argc, char* argv[]) {
     std::signal(SIGTERM, handle_signal);
 
     try {
-        const std::string server_ip = argv[1];
-        const auto server_port = static_cast<uint16_t>(std::stoi(argv[2]));
         const std::string v_ip_str = argv[3];
         const std::string if_name = "nova1";
 
         auto tun = std::make_unique<TunDevice>(if_name);
         auto udp = std::make_unique<UdpSocket>(AF_INET);
-        NetAddress server_addr(server_ip, server_port);
+        NetAddress server_addr(argv[1], static_cast<uint16_t>(std::stoi(argv[2])));
 
-        std::vector<uint8_t> my_priv;
-        std::vector<uint8_t> my_pub;
+        std::vector<uint8_t> my_priv, my_pub;
         CryptoEngine::generate_ecdh_keys(my_priv, my_pub);
 
         std::unique_ptr<CryptoEngine> crypto;
         bool handshaked = false;
 
         tun->up(v_ip_str, "255.255.255.0");
-
-        // Sonar: Используем init-statement в if для mtu_cmd
-        if (const std::string mtu_cmd = "ip link set dev " + if_name + " mtu 1400"; system(mtu_cmd.c_str()) != 0) {
+        if (const std::string mtu_cmd = std::format("ip link set dev {} mtu 1400", if_name); system(mtu_cmd.c_str()) != 0) {
              std::cerr << "[Warning] Failed to set MTU" << std::endl;
         }
 
@@ -89,56 +124,32 @@ int main(int argc, char* argv[]) {
         engine.add(tun->get_fd(), EPOLLIN, &tun_ctx);
         engine.add(udp->get_fd(), EPOLLIN, &udp_ctx);
 
-        std::cout << "[NovaLink] Client " << v_ip_str << " started." << std::endl;
+        ClientContext c_ctx{*udp, *tun, server_addr, crypto, handshaked, my_priv, my_pub};
+        std::cout << std::format("[NovaLink] Client {} started.\n", v_ip_str);
 
         std::vector<epoll_event> event_buffer(16);
         auto last_hello = std::chrono::steady_clock::now();
 
         while (global_running.load()) {
-            // Sonar: Init-statement для "now" внутри if
             if (auto now = std::chrono::steady_clock::now();
                 !handshaked && std::chrono::duration_cast<std::chrono::seconds>(now - last_hello).count() >= 2) {
-                send_handshake(udp.get(), server_addr, my_pub, v_ip_str);
+                send_handshake(c_ctx, v_ip_str);
                 last_hello = now;
             }
 
             int nfds = engine.wait(event_buffer, 100);
             for (int n = 0; n < nfds; ++n) {
-                auto* ctx = static_cast<EventContext*>(event_buffer[n].data.ptr);
-
+                const auto* ctx = static_cast<const EventContext*>(event_buffer[n].data.ptr);
                 if (ctx->fd == udp->get_fd()) {
-                    uint8_t buf[4096];
-                    NetAddress sender;
-                    ssize_t len = udp->receive(buf, sender);
-                    if (len <= 0) continue;
-
-                    // Sonar: Используем std::to_underlying
-                    if (buf[0] == std::to_underlying(PacketType::Handshake) && !handshaked) {
-                        if (len < 33) continue;
-                        std::vector<uint8_t> srv_pub(buf + 1, buf + 33);
-                        auto shared = CryptoEngine::derive_shared_secret(my_priv, srv_pub);
-                        crypto = std::make_unique<CryptoEngine>(shared);
-                        handshaked = true;
-                        std::cout << "[Handshake] SUCCESS!" << std::endl;
-                    }
-                    else if (buf[0] == std::to_underlying(PacketType::Data) && handshaked) {
-                        auto decrypted = crypto->decrypt({buf + 1, static_cast<size_t>(len - 1)});
-                        tun->write_packet(decrypted);
-                    }
+                    handle_udp_event(c_ctx);
                 }
                 else if (ctx->fd == tun->get_fd() && handshaked) {
-                    tun->read_all_packets([&](std::span<const uint8_t> packet) {
-                        auto encrypted = crypto->encrypt(packet);
-                        // Sonar: std::to_underlying
-                        std::vector final_pkt = { std::to_underlying(PacketType::Data) };
-                        final_pkt.insert(final_pkt.end(), encrypted.begin(), encrypted.end());
-                        udp->send(final_pkt, server_addr);
-                    });
+                    handle_tun_event(c_ctx);
                 }
             }
         }
     } catch (const std::exception& e) {
-        std::cerr << "[Critical] " << e.what() << std::endl;
+        std::cerr << std::format("[Critical] {}\n", e.what());
         return EXIT_FAILURE;
     }
     return EXIT_SUCCESS;

@@ -12,12 +12,20 @@
 #include <linux/if_tun.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <cstring>
 #include <stdexcept>
 #include <cstdlib>
+#include <format>
 
-TunDevice::TunDevice(const std::string& dev_name) : _fd(-1) {
-    _fd = open("/dev/net/tun", O_RDWR | O_CLOEXEC | O_NONBLOCK);
+class TunException : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+TunDevice::TunDevice(const std::string& dev_name)
+    : _fd(open("/dev/net/tun", O_RDWR | O_CLOEXEC | O_NONBLOCK)) {
+
     if (_fd == -1) {
         throw std::system_error(errno, std::system_category(), "Failed to open /dev/net/tun");
     }
@@ -30,7 +38,8 @@ TunDevice::TunDevice(const std::string& dev_name) : _fd(-1) {
         std::strncpy(ifr.ifr_name, dev_name.c_str(), IFNAMSIZ - 1);
     }
 
-    if (ioctl(_fd, TUNSETIFF, reinterpret_cast<void*>(&ifr)) == -1) {
+    // Use static_cast instead of reinterpret_cast
+    if (ioctl(_fd, TUNSETIFF, static_cast<void*>(&ifr)) == -1) {
         int err = errno;
         close(_fd);
         throw std::system_error(err, std::system_category(), "ioctl TUNSETIFF failed");
@@ -40,11 +49,13 @@ TunDevice::TunDevice(const std::string& dev_name) : _fd(-1) {
 }
 
 TunDevice::~TunDevice() {
-    if (_fd != -1) close(_fd);
+    if (_fd != -1) {
+        close(_fd);
+    }
 }
 
 TunDevice::TunDevice(TunDevice&& other) noexcept
-    : _fd(other._fd), _name(std::move(other._name)) {
+    : _fd(other._fd), _name(std::move(other._name)), _buffer{} {
     other._fd = -1;
 }
 
@@ -59,19 +70,19 @@ TunDevice& TunDevice::operator=(TunDevice&& other) noexcept {
 }
 
 void TunDevice::up(const std::string& ip_addr, const std::string& mask) {
-    std::string cmd_addr = "ip addr add " + ip_addr + "/" + mask + " dev " + _name;
-    std::string cmd_link = "ip link set dev " + _name + " up";
+    const std::string cmd_addr = std::format("ip addr add {}/{} dev {}", ip_addr, mask, _name);
+    const std::string cmd_link = std::format("ip link set dev {} up", _name);
 
-    if (std::system(cmd_addr.c_str()) != 0)
-        throw std::runtime_error("Failed to set IP address");
-    if (std::system(cmd_link.c_str()) != 0)
-        throw std::runtime_error("Failed to set link UP");
+    if (std::system(cmd_addr.c_str()) != 0) {
+        throw TunException(std::format("Failed to set IP address for {}", _name));
+    }
+    if (std::system(cmd_link.c_str()) != 0) {
+        throw TunException(std::format("Failed to set link UP for {}", _name));
+    }
 }
 
 void TunDevice::write_packet(std::span<const uint8_t> packet) {
-    if (write(_fd, packet.data(), packet.size()) == -1) {
-        if (errno != EAGAIN && errno != EINTR) {
-            throw std::system_error(errno, std::system_category(), "TUN write error");
-        }
+    if (write(_fd, packet.data(), packet.size()) == -1 && errno != EAGAIN && errno != EINTR) {
+        throw std::system_error(errno, std::system_category(), "TUN write error");
     }
 }
