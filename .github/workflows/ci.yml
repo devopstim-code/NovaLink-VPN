@@ -26,7 +26,7 @@ jobs:
 
       - name: Install liboqs (Post-Quantum Library)
         run: |
-          git clone --depth 1-b 0.10.0 https://github.com/open-quantum-safe/liboqs.git
+          git clone --depth 1 -b 0.10.0 https://github.com/open-quantum-safe/liboqs.git
           cmake -S liboqs -B liboqs/build -DBUILD_SHARED_LIBS=ON
           sudo cmake --build liboqs/build --target install
           sudo ldconfig
