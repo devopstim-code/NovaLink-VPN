@@ -1,21 +1,24 @@
 #include "CryptoEngine.hpp"
-#include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/kdf.h>
+#include <openssl/params.h>
 #include <openssl/err.h>
-#include <algorithm>
 #include <cstring>
 
+extern "C" {
+#include <oqs/oqs.h>
+}
 
-CryptoEngine::CryptoEngine(const std::vector<std::byte>& key)
-    : _key(key), _ctx(EVP_CIPHER_CTX_new()) {
-    if (_ctx == nullptr) {
-        throw CryptoException("Failed to create EVP_CIPHER_CTX");
-    }
+CryptoEngine::CryptoEngine(const std::vector<std::byte>& raw_shared_secret)
+    : _ctx(EVP_CIPHER_CTX_new()) {
+    if (!_ctx) throw CryptoException("EVP_CIPHER_CTX_new failed");
+    _key = perform_hkdf(raw_shared_secret);
 }
 
 CryptoEngine::~CryptoEngine() {
-    if (_ctx != nullptr) {
-        EVP_CIPHER_CTX_free(_ctx);
+    if (_ctx) EVP_CIPHER_CTX_free(_ctx);
+    if (!_key.empty()) {
+        OPENSSL_cleanse(_key.data(), _key.size());
     }
 }
 
@@ -26,9 +29,7 @@ CryptoEngine::CryptoEngine(CryptoEngine&& other) noexcept
 
 CryptoEngine& CryptoEngine::operator=(CryptoEngine&& other) noexcept {
     if (this != &other) {
-        if (_ctx != nullptr) {
-            EVP_CIPHER_CTX_free(_ctx);
-        }
+        if (_ctx) EVP_CIPHER_CTX_free(_ctx);
         _key = std::move(other._key);
         _ctx = other._ctx;
         other._ctx = nullptr;
@@ -36,164 +37,155 @@ CryptoEngine& CryptoEngine::operator=(CryptoEngine&& other) noexcept {
     return *this;
 }
 
-// --- Static ECDH methods (X25519) ---
+std::vector<std::byte> CryptoEngine::perform_hkdf(std::span<const std::byte> secret) {
+    std::vector<std::byte> derived(32);
+    EVP_KDF *kdf = EVP_KDF_fetch(nullptr, "HKDF", nullptr);
+    EVP_KDF_CTX *kctx = EVP_KDF_CTX_new(kdf);
+    EVP_KDF_free(kdf);
 
-void CryptoEngine::generate_ecdh_keys(std::vector<std::byte>& priv_out, std::vector<std::byte>& pub_out) {
-    auto* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, nullptr);
-    EVP_PKEY* pkey = nullptr;
+    if (!kctx) throw CryptoException("HKDF context allocation failed");
 
-    if (ctx == nullptr || EVP_PKEY_keygen_init(ctx) <= 0 || EVP_PKEY_keygen(ctx, &pkey) <= 0) {
-        if (ctx != nullptr) EVP_PKEY_CTX_free(ctx);
-        throw CryptoException("Failed to generate X25519 keys");
+    const OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string("digest", (char*)"SHA256", 0),
+        OSSL_PARAM_construct_octet_string("key", (void*)secret.data(), secret.size()),
+        OSSL_PARAM_construct_octet_string("salt", (void*)"NovaLink-PQ-v1", 14),
+        OSSL_PARAM_construct_octet_string("info", (void*)"Session-Key", 11),
+        OSSL_PARAM_construct_end()
+    };
+
+    if (EVP_KDF_derive(kctx, reinterpret_cast<unsigned char*>(derived.data()), derived.size(), params) <= 0) {
+        EVP_KDF_CTX_free(kctx);
+        throw CryptoException("HKDF derivation failed");
     }
 
-    size_t priv_len = 32;
-    priv_out.resize(priv_len);
-    EVP_PKEY_get_raw_private_key(pkey, reinterpret_cast<unsigned char*>(priv_out.data()), &priv_len);
+    EVP_KDF_CTX_free(kctx);
+    return derived;
+}
 
-    size_t pub_len = 32;
-    pub_out.resize(pub_len);
-    EVP_PKEY_get_raw_public_key(pkey, reinterpret_cast<unsigned char*>(pub_out.data()), &pub_len);
+void CryptoEngine::encrypt_inplace(std::span<std::byte> buffer, size_t data_offset, size_t data_len, size_t& out_len) {
+    unsigned char* iv_ptr = reinterpret_cast<unsigned char*>(buffer.data() + data_offset - IV_SIZE);
+    unsigned char* data_ptr = reinterpret_cast<unsigned char*>(buffer.data() + data_offset);
+
+    if (RAND_bytes(iv_ptr, IV_SIZE) != 1) throw CryptoException("RAND_bytes failed");
+
+    EVP_CIPHER_CTX_reset(_ctx);
+
+    if (EVP_EncryptInit_ex(_ctx, EVP_chacha20_poly1305(), nullptr,
+                           reinterpret_cast<const unsigned char*>(_key.data()), iv_ptr) != 1)
+        throw CryptoException("EVP_EncryptInit failed");
+
+    int len = 0;
+    EVP_EncryptUpdate(_ctx, data_ptr, &len, data_ptr, static_cast<int>(data_len));
+
+    int final_len = 0;
+    EVP_EncryptFinal_ex(_ctx, data_ptr + len, &final_len);
+    if (EVP_CIPHER_CTX_ctrl(_ctx, EVP_CTRL_AEAD_GET_TAG, TAG_SIZE, data_ptr + data_len) != 1)
+        throw CryptoException("Failed to get AEAD tag");
+
+    out_len = IV_SIZE + data_len + TAG_SIZE;
+}
+bool CryptoEngine::decrypt_inplace(std::span<std::byte> buffer, size_t packet_offset, size_t packet_len, size_t& data_out_len) {
+    if (packet_len < IV_SIZE + TAG_SIZE) return false;
+
+    unsigned char* iv_ptr = reinterpret_cast<unsigned char*>(buffer.data() + packet_offset);
+    unsigned char* cipher_ptr = iv_ptr + IV_SIZE;
+    size_t cipher_len = packet_len - IV_SIZE - TAG_SIZE;
+    unsigned char* tag_ptr = cipher_ptr + cipher_len;
+
+    EVP_CIPHER_CTX_reset(_ctx);
+
+    if (EVP_DecryptInit_ex(_ctx, EVP_chacha20_poly1305(), nullptr,
+                           reinterpret_cast<const unsigned char*>(_key.data()), iv_ptr) != 1)
+        return false;
+
+    int len = 0;
+    if (EVP_DecryptUpdate(_ctx, cipher_ptr, &len, cipher_ptr, static_cast<int>(cipher_len)) != 1)
+        return false;
+    if (EVP_CIPHER_CTX_ctrl(_ctx, EVP_CTRL_AEAD_SET_TAG, TAG_SIZE, tag_ptr) != 1)
+        return false;
+
+    int outl = 0;
+    if (EVP_DecryptFinal_ex(_ctx, cipher_ptr + len, &outl) <= 0) return false;
+
+    data_out_len = cipher_len;
+    return true;
+}
+
+void CryptoEngine::generate_ecdh_keys(std::vector<std::byte>& priv_out, std::vector<std::byte>& pub_out) {
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, nullptr);
+    EVP_PKEY* pkey = nullptr;
+
+    if (!ctx || EVP_PKEY_keygen_init(ctx) <= 0 || EVP_PKEY_keygen(ctx, &pkey) <= 0) {
+        if (ctx) EVP_PKEY_CTX_free(ctx);
+        throw CryptoException("X25519 keygen failed");
+    }
+
+    size_t len = 32;
+    priv_out.resize(len); pub_out.resize(len);
+    EVP_PKEY_get_raw_private_key(pkey, reinterpret_cast<uint8_t*>(priv_out.data()), &len);
+    EVP_PKEY_get_raw_public_key(pkey, reinterpret_cast<uint8_t*>(pub_out.data()), &len);
 
     EVP_PKEY_free(pkey);
     EVP_PKEY_CTX_free(ctx);
 }
 
 std::vector<std::byte> CryptoEngine::derive_shared_secret(const std::vector<std::byte>& my_priv, const std::vector<std::byte>& peer_pub) {
-    if (my_priv.size() != 32 || peer_pub.size() != 32) {
-        throw CryptoException("Invalid key sizes for X25519");
-    }
+    auto* priv = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, nullptr, reinterpret_cast<const uint8_t*>(my_priv.data()), 32);
+    auto* peer = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, nullptr, reinterpret_cast<const uint8_t*>(peer_pub.data()), 32);
 
-    auto* priv_key = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, nullptr,
-        reinterpret_cast<const unsigned char*>(my_priv.data()), my_priv.size());
-    auto* peer_key = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, nullptr,
-        reinterpret_cast<const unsigned char*>(peer_pub.data()), peer_pub.size());
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(priv, nullptr);
+    EVP_PKEY_derive_init(ctx);
+    EVP_PKEY_derive_set_peer(ctx, peer);
 
-    if (priv_key == nullptr || peer_key == nullptr) {
-        if (priv_key != nullptr) EVP_PKEY_free(priv_key);
-        if (peer_key != nullptr) EVP_PKEY_free(peer_key);
-        throw CryptoException("Failed to load keys for derivation");
-    }
+    size_t len;
+    EVP_PKEY_derive(ctx, nullptr, &len);
+    std::vector<std::byte> secret(len);
+    EVP_PKEY_derive(ctx, reinterpret_cast<uint8_t*>(secret.data()), &len);
 
-    auto* ctx = EVP_PKEY_CTX_new(priv_key, nullptr);
-    if (ctx == nullptr || EVP_PKEY_derive_init(ctx) <= 0 || EVP_PKEY_derive_set_peer(ctx, peer_key) <= 0) {
-        EVP_PKEY_CTX_free(ctx);
-        EVP_PKEY_free(priv_key);
-        EVP_PKEY_free(peer_key);
-        throw CryptoException("ECDH derivation init failed");
-    }
-
-    size_t secret_len = 0;
-    EVP_PKEY_derive(ctx, nullptr, &secret_len);
-    std::vector<std::byte> secret(secret_len);
-    EVP_PKEY_derive(ctx, reinterpret_cast<unsigned char*>(secret.data()), &secret_len);
-
-    EVP_PKEY_CTX_free(ctx);
-    EVP_PKEY_free(priv_key);
-    EVP_PKEY_free(peer_key);
-
+    EVP_PKEY_free(priv); EVP_PKEY_free(peer); EVP_PKEY_CTX_free(ctx);
     return secret;
 }
 
-// --- External Methods with Obfuscation (Padding) ---
 
-std::vector<std::byte> CryptoEngine::encrypt(std::span<const std::byte> plaintext) {
-    auto encrypted = encrypt_internal(plaintext);
-    if (encrypted.size() + 2 > TARGET_PACKET_SIZE) {
-        return encrypted;
+void CryptoEngine::generate_kyber_keys(std::vector<std::byte>& priv_out, std::vector<std::byte>& pub_out) {
+    OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_kyber_768);
+    if (!kem) throw CryptoException("Kyber-768 init failed");
+
+    priv_out.resize(kem->length_secret_key);
+    pub_out.resize(kem->length_public_key);
+
+    if (OQS_KEM_keypair(kem, reinterpret_cast<uint8_t*>(pub_out.data()), reinterpret_cast<uint8_t*>(priv_out.data())) != OQS_SUCCESS) {
+        OQS_KEM_free(kem);
+        throw CryptoException("Kyber keygen failed");
     }
-
-    const auto padding_len = TARGET_PACKET_SIZE - encrypted.size() - 2;
-    std::vector<std::byte> final_pkt = encrypted;
-    final_pkt.resize(TARGET_PACKET_SIZE);
-
-    RAND_bytes(reinterpret_cast<unsigned char*>(final_pkt.data() + encrypted.size()), static_cast<int>(padding_len));
-
-    const auto enc_size = static_cast<uint16_t>(encrypted.size());
-    final_pkt[TARGET_PACKET_SIZE - 2] = static_cast<std::byte>(enc_size & 0xFF);
-    final_pkt[TARGET_PACKET_SIZE - 1] = static_cast<std::byte>((enc_size >> 8) & 0xFF);
-
-    return final_pkt;
+    OQS_KEM_free(kem);
 }
 
-std::vector<std::byte> CryptoEngine::decrypt(std::span<const std::byte> ciphertext) {
-    if (ciphertext.size() != TARGET_PACKET_SIZE) {
-        return decrypt_internal(ciphertext);
+std::pair<std::vector<std::byte>, std::vector<std::byte>> CryptoEngine::kyber_encapsulate(const std::vector<std::byte>& client_pub) {
+    OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_kyber_768);
+    std::vector<std::byte> ct(kem->length_ciphertext);
+    std::vector<std::byte> ss(kem->length_shared_secret);
+
+    if (OQS_KEM_encaps(kem, reinterpret_cast<uint8_t*>(ct.data()), reinterpret_cast<uint8_t*>(ss.data()),
+                       reinterpret_cast<const uint8_t*>(client_pub.data())) != OQS_SUCCESS) {
+        OQS_KEM_free(kem);
+        throw CryptoException("Kyber encapsulate failed");
     }
-
-    const auto b1 = static_cast<uint16_t>(ciphertext[TARGET_PACKET_SIZE - 2]);
-    const auto b2 = static_cast<uint16_t>(ciphertext[TARGET_PACKET_SIZE - 1]);
-    const uint16_t real_size = b1 | (b2 << 8);
-
-    if (real_size > TARGET_PACKET_SIZE - 2) {
-        throw CryptoException("Invalid padding or corrupted packet");
-    }
-
-    return decrypt_internal(ciphertext.subspan(0, real_size));
+    OQS_KEM_free(kem);
+    return {ct, ss};
 }
 
-// --- Internal encryption (AEAD: ChaCha20-Poly1305) ---
-
-std::vector<std::byte> CryptoEngine::encrypt_internal(std::span<const std::byte> plaintext) {
-    std::vector<std::byte> iv(IV_SIZE);
-    RAND_bytes(reinterpret_cast<unsigned char*>(iv.data()), IV_SIZE);
-
-    std::vector<std::byte> ciphertext(plaintext.size());
-    int len = 0;
-    uint8_t tag[TAG_SIZE];
-
-    if (EVP_EncryptInit_ex(_ctx, EVP_chacha20_poly1305(), nullptr,
-        reinterpret_cast<const unsigned char*>(_key.data()),
-        reinterpret_cast<const unsigned char*>(iv.data())) <= 0) {
-        throw CryptoException("Encryption init failed");
+std::vector<std::byte> CryptoEngine::kyber_decapsulate(std::span<const std::byte> ciphertext, std::span<const std::byte> my_priv) {
+    OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_kyber_768);
+    if (!kem) throw CryptoException("Kyber init failed");
+    std::vector<std::byte> ss(kem->length_shared_secret);
+    if (OQS_KEM_decaps(kem, reinterpret_cast<uint8_t*>(ss.data()),
+                       reinterpret_cast<const uint8_t*>(ciphertext.data()),
+                       reinterpret_cast<const uint8_t*>(my_priv.data())) != OQS_SUCCESS) {
+        OQS_KEM_free(kem);
+        throw CryptoException("Kyber decapsulate failed");
     }
 
-    EVP_EncryptUpdate(_ctx, reinterpret_cast<unsigned char*>(ciphertext.data()), &len,
-        reinterpret_cast<const unsigned char*>(plaintext.data()), static_cast<int>(plaintext.size()));
-
-    int final_len = 0;
-    EVP_EncryptFinal_ex(_ctx, reinterpret_cast<unsigned char*>(ciphertext.data()) + len, &final_len);
-    EVP_CIPHER_CTX_ctrl(_ctx, EVP_CTRL_AEAD_GET_TAG, TAG_SIZE, tag);
-
-    std::vector<std::byte> result;
-    result.reserve(IV_SIZE + ciphertext.size() + TAG_SIZE);
-    result.insert(result.end(), iv.begin(), iv.end());
-    result.insert(result.end(), ciphertext.begin(), ciphertext.end());
-
-    const auto* tag_ptr = reinterpret_cast<const std::byte*>(tag);
-    result.insert(result.end(), tag_ptr, tag_ptr + TAG_SIZE);
-    return result;
-}
-
-std::vector<std::byte> CryptoEngine::decrypt_internal(std::span<const std::byte> ciphertext) {
-    if (ciphertext.size() < IV_SIZE + TAG_SIZE) {
-        throw CryptoException("Ciphertext too short");
-    }
-
-    const auto* raw_ptr = reinterpret_cast<const unsigned char*>(ciphertext.data());
-    const auto body_len = ciphertext.size() - IV_SIZE - TAG_SIZE;
-    const auto* actual_cipher = raw_ptr + IV_SIZE;
-    const auto* tag_ptr = actual_cipher + body_len;
-
-    std::vector<std::byte> plaintext(body_len);
-    int len = 0;
-
-    if (EVP_DecryptInit_ex(_ctx, EVP_chacha20_poly1305(), nullptr,
-        reinterpret_cast<const unsigned char*>(_key.data()), raw_ptr) <= 0) {
-        throw CryptoException("Decryption init failed");
-    }
-
-    auto* out_ptr = reinterpret_cast<unsigned char*>(plaintext.data());
-    EVP_DecryptUpdate(_ctx, out_ptr, &len, actual_cipher, static_cast<int>(body_len));
-
-    uint8_t tag_buffer[TAG_SIZE];
-    std::memcpy(tag_buffer, tag_ptr, TAG_SIZE);
-    EVP_CIPHER_CTX_ctrl(_ctx, EVP_CTRL_AEAD_SET_TAG, TAG_SIZE, tag_buffer);
-
-    int outl = 0;
-    if (::EVP_DecryptFinal_ex(_ctx, reinterpret_cast<unsigned char*>(plaintext.data()) + len, &outl) <= 0) {
-        throw CryptoException("Decryption integrity check failed (MAC mismatch)");
-    }
-
-    return plaintext;
+    OQS_KEM_free(kem);
+    return ss;
 }

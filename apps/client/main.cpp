@@ -12,6 +12,8 @@
 #include "core/network/UdpSocket.hpp"
 #include "core/tunnel/TunDevice.hpp"
 #include "core/crypto/CryptoEngine.hpp"
+#include "core/network/Protocol.hpp"
+#include "core/network/SslLayer.hpp"
 
 #include <iostream>
 #include <vector>
@@ -19,121 +21,157 @@
 #include <atomic>
 #include <memory>
 #include <chrono>
-#include <format>
-#include <arpa/inet.h>
 #include <cstring>
-#include <utility>
+#include <arpa/inet.h>
+#include <openssl/crypto.h>
 
-#include "core/network/SslLayer.hpp"
+using namespace NovaProtocol;
 
 namespace {
-    const std::atomic<bool> global_running{true};
+    std::atomic<bool> global_running{true};
 }
 
-void handle_signal([[maybe_unused]] int sig) {
-    const_cast<std::atomic<bool>&>(global_running).store(false);
-}
-
-enum class PacketType : uint8_t {
-    Handshake = 0x01,
-    Data      = 0x02
-};
+void handle_signal(int) { global_running.store(false); }
 
 struct ClientContext {
     UdpSocket& udp;
     TunDevice& tun;
     const NetAddress& server_addr;
-    std::unique_ptr<CryptoEngine>& crypto;
-    bool& handshaked;
-    const std::vector<std::byte>& my_priv;
-    const std::vector<std::byte>& my_pub;
+    std::unique_ptr<CryptoEngine> crypto;
+    bool handshaked = false;
+
+    std::vector<std::byte> my_priv, my_pub;
+    std::vector<std::byte> kyber_priv, kyber_pub;
 };
-void send_handshake(const ClientContext& ctx, const std::string& v_ip_str) {
-    std::vector<std::byte> hello;
-    hello.push_back(static_cast<std::byte>(PacketType::Handshake));
-    hello.insert(hello.end(), ctx.my_pub.begin(), ctx.my_pub.end());
+bool is_server(const NetAddress& sender, const NetAddress& server) {
+    return (sender.get_port() == server.get_port()) && sender.is_same_ip(server);
+}
 
-    uint32_t my_v_ip;
-    if (inet_pton(AF_INET, v_ip_str.c_str(), &my_v_ip) <= 0) return;
-    const auto* ip_bytes = reinterpret_cast<const std::byte*>(&my_v_ip);
-    hello.insert(hello.end(), ip_bytes, ip_bytes + sizeof(my_v_ip));
+void send_handshake(ClientContext& ctx, uint32_t v_ip) {
+    static thread_local std::byte handshake_buf[Sizes::MTU];
+    std::memset(handshake_buf, 0, Sizes::MTU);
 
-    // МАСКИРОВКА: Оборачиваем пакет в TLS заголовок
-    auto ssl_pkt = SslLayer::wrap(hello, SslLayer::RECORD_HANDSHAKE);
+    size_t ptr = 5;
+    handshake_buf[ptr++] = static_cast<std::byte>(PacketType::Handshake);
 
-    if (ctx.udp.send(ssl_pkt, ctx.server_addr) < 0) {
-        std::cerr << "[Handshake] Failed to send packet" << std::endl;
-    } else {
-        std::cout << "[Handshake] Sending public key + IP (SSL masked)..." << std::endl;
-    }
+    uint16_t c_len = static_cast<uint16_t>(ctx.my_pub.size());
+    set_u16(handshake_buf + ptr, c_len);
+    ptr += 2;
+    std::memcpy(handshake_buf + ptr, ctx.my_pub.data(), c_len);
+    ptr += c_len;
+
+    uint16_t q_len = static_cast<uint16_t>(ctx.kyber_pub.size());
+    set_u16(handshake_buf + ptr, q_len);
+    ptr += 2;
+    std::memcpy(handshake_buf + ptr, ctx.kyber_pub.data(), q_len);
+    ptr += q_len;
+
+    std::memcpy(handshake_buf + ptr, &v_ip, 4);
+    ptr += 4;
+
+    auto final_span = SslLayer::wrap_inplace({handshake_buf, Sizes::MTU}, ptr - 5, SslLayer::RECORD_HANDSHAKE);
+    ctx.udp.send(final_span, ctx.server_addr);
+    std::cout << "[UDP] Handshake sent to server..." << std::endl;
 }
 
 void handle_udp_event(ClientContext& ctx) {
-    std::byte buf[4096];
+    static thread_local std::byte net_buf[Sizes::MTU];
     NetAddress sender;
-    ssize_t len = ctx.udp.receive(buf, sender);
-    if (len <= 0) return;
-    auto raw_data = SslLayer::unwrap(std::span{buf, static_cast<size_t>(len)});
-    if (raw_data.empty()) return;
 
-    const auto p_type = static_cast<uint8_t>(raw_data[0]);
+    ssize_t received = ctx.udp.receive(net_buf, sender);
+    if (received <= 5) return;
+    std::cout << "[UDP] Received " << received << " bytes from " << sender.to_string() << std::endl;
 
-    if (p_type == std::to_underlying(PacketType::Handshake) && !ctx.handshaked) {
-        if (raw_data.size() < 33) return;
-
-        std::vector<std::byte> srv_pub(32);
-        std::memcpy(srv_pub.data(), raw_data.data() + 1, 32);
-
-        auto shared = CryptoEngine::derive_shared_secret(ctx.my_priv, srv_pub);
-        ctx.crypto = std::make_unique<CryptoEngine>(shared);
-        ctx.handshaked = true;
-        std::cout << "[Handshake] SUCCESS! Encryption established." << std::endl;
+    if (!is_server(sender, ctx.server_addr)) {
+        std::cout << "[DEBUG] Filter failed: Sender " << sender.to_string()
+                  << " != Expected " << ctx.server_addr.to_string() << std::endl;
+        return;
     }
-    else if (p_type == std::to_underlying(PacketType::Data) && ctx.handshaked) {
-        auto decrypted = ctx.crypto->decrypt(raw_data.subspan(1));
-        ctx.tun.write_packet(decrypted);
+
+    auto payload = SslLayer::unwrap_inplace({net_buf, static_cast<size_t>(received)});
+    if (payload.empty()) {
+        std::cout << "[DEBUG] SSL Unwrap failed!" << std::endl;
+        return;
+    }
+    const auto p_type = static_cast<PacketType>(payload[0]);
+
+    if (p_type == PacketType::Handshake && !ctx.handshaked) {
+        try {
+            size_t offset = 1;
+            uint16_t s_c_len = get_u16(payload.data() + offset);
+            offset += 2;
+            std::vector<std::byte> srv_pub(payload.data() + offset, payload.data() + offset + s_c_len);
+            offset += s_c_len;
+
+            uint16_t s_q_len = get_u16(payload.data() + offset);
+            offset += 2;
+
+            std::vector<std::byte> hybrid_secret;
+            auto ecdh_ss = CryptoEngine::derive_shared_secret(ctx.my_priv, srv_pub);
+            hybrid_secret.insert(hybrid_secret.end(), ecdh_ss.begin(), ecdh_ss.end());
+
+            if (s_q_len > 0) {
+                std::span<const std::byte> ct{payload.data() + offset, s_q_len};
+                auto pq_ss = CryptoEngine::kyber_decapsulate(ct, ctx.kyber_priv);
+                hybrid_secret.insert(hybrid_secret.end(), pq_ss.begin(), pq_ss.end());
+            }
+
+            ctx.crypto = std::make_unique<CryptoEngine>(hybrid_secret);
+            ctx.handshaked = true;
+
+            OPENSSL_cleanse(ctx.my_priv.data(), ctx.my_priv.size());
+            OPENSSL_cleanse(ctx.kyber_priv.data(), ctx.kyber_priv.size());
+
+            std::cout << "[NovaLink] SUCCESS! Quantum-Safe Tunnel established." << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[Handshake Error] " << e.what() << std::endl;
+        }
+    }
+    else if (p_type == PacketType::Data && ctx.handshaked) {
+        size_t out_len = 0;
+        if (ctx.crypto->decrypt_inplace(payload, 1, payload.size() - 1, out_len)) {
+            ctx.tun.write_packet({payload.data() + 1 + CryptoEngine::IV_SIZE, out_len});
+        }
     }
 }
 
 void handle_tun_event(ClientContext& ctx) {
-    ctx.tun.read_all_packets([&ctx](std::span<const std::byte> packet) {
-        if (!ctx.crypto) return;
+    static thread_local std::byte tun_buf[Sizes::MTU];
+    constexpr size_t header_room = 5 + 1 + CryptoEngine::IV_SIZE;
 
-        auto encrypted = ctx.crypto->encrypt(packet);
+    ctx.tun.read_all_packets([&](std::span<const std::byte> packet) {
+        if (!ctx.handshaked || packet.size() > (Sizes::MTU - header_room - 16)) return;
 
-        std::vector<std::byte> final_pkt;
-        final_pkt.reserve(encrypted.size() + 1);
-        final_pkt.push_back(static_cast<std::byte>(PacketType::Data));
-        final_pkt.insert(final_pkt.end(), encrypted.begin(), encrypted.end());
+        std::memcpy(tun_buf + header_room, packet.data(), packet.size());
+        size_t enc_len = 0;
+        ctx.crypto->encrypt_inplace({tun_buf, Sizes::MTU}, header_room, packet.size(), enc_len);
 
-        auto ssl_pkt = SslLayer::wrap(final_pkt, SslLayer::RECORD_APPLICATION_DATA);
-        (void)ctx.udp.send(ssl_pkt, ctx.server_addr);
+        tun_buf[5] = static_cast<std::byte>(PacketType::Data);
+        auto final_span = SslLayer::wrap_inplace({tun_buf, Sizes::MTU},
+                                                enc_len + 1 + CryptoEngine::IV_SIZE,
+                                                SslLayer::RECORD_APPLICATION_DATA);
+        ctx.udp.send(final_span, ctx.server_addr);
     });
 }
 int main(int argc, char* argv[]) {
     if (argc < 4) {
-        std::cerr << std::format("Usage: {} <server_ip> <port> <virtual_ip>\n", argv[0]);
-        return EXIT_FAILURE;
+        std::cerr << "Usage: " << argv[0] << " <srv_ip> <port> <my_tun_ip>\n";
+        return 1;
     }
-
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
     try {
-        const std::string v_ip_str = argv[3];
-        const std::string if_name = "nova1";
-
-        auto tun = std::make_unique<TunDevice>(if_name);
-        auto udp = std::make_unique<UdpSocket>(AF_INET);
         NetAddress server_addr(argv[1], static_cast<uint16_t>(std::stoi(argv[2])));
+        uint32_t my_v_ip = inet_addr(argv[3]);
 
-        std::vector<std::byte> my_priv, my_pub;
-        CryptoEngine::generate_ecdh_keys(my_priv, my_pub);
+        auto tun = std::make_unique<TunDevice>("nova_cl");
+        auto udp = std::make_unique<UdpSocket>(AF_INET);
+        tun->up(argv[3], "255.255.255.0");
 
-        std::unique_ptr<CryptoEngine> crypto;
-        bool handshaked = false;
-
-        tun->up(v_ip_str, "255.255.255.0");
+        ClientContext c_ctx{*udp, *tun, server_addr};
+        CryptoEngine::generate_ecdh_keys(c_ctx.my_priv, c_ctx.my_pub);
+        CryptoEngine::generate_kyber_keys(c_ctx.kyber_priv, c_ctx.kyber_pub);
 
         EpollEngine engine;
         EventContext tun_ctx{tun->get_fd(), tun.get(), 0};
@@ -141,33 +179,33 @@ int main(int argc, char* argv[]) {
         engine.add(tun->get_fd(), EPOLLIN, &tun_ctx);
         engine.add(udp->get_fd(), EPOLLIN, &udp_ctx);
 
-        ClientContext c_ctx{*udp, *tun, server_addr, crypto, handshaked, my_priv, my_pub};
-        std::cout << std::format("[NovaLink] Client {} started.\n", v_ip_str);
+        std::vector<epoll_event> events(64);
+        auto last_handshake = std::chrono::steady_clock::now();
 
-        std::vector<epoll_event> event_buffer(16);
-        auto last_hello = std::chrono::steady_clock::now();
+        std::cout << "[NovaLink] Connecting to quantum-safe server " << argv[1] << "...\n";
 
-        while (global_running.load()) {
+        while (global_running.load(std::memory_order_relaxed)) {
             auto now = std::chrono::steady_clock::now();
-            if (!handshaked && std::chrono::duration_cast<std::chrono::seconds>(now - last_hello).count() >= 2) {
-                send_handshake(c_ctx, v_ip_str);
-                last_hello = now;
+            if (!c_ctx.handshaked) {
+                if (now - last_handshake > std::chrono::seconds(2)) {
+                    send_handshake(c_ctx, my_v_ip);
+                    last_handshake = now;
+                }
             }
 
-            int nfds = engine.wait(event_buffer, 100);
-            for (int n = 0; n < nfds; ++n) {
-                const auto* event_ctx = static_cast<const EventContext*>(event_buffer[n].data.ptr);
-                if (event_ctx->fd == udp->get_fd()) {
-                    handle_udp_event(c_ctx);
-                }
-                else if (event_ctx->fd == tun->get_fd() && handshaked) {
-                    handle_tun_event(c_ctx);
-                }
+            int nfds = engine.wait(events, 100);
+
+            for (int i = 0; i < nfds; ++i) {
+                auto* ctx = static_cast<EventContext*>(events[i].data.ptr);
+                if (ctx->fd == udp->get_fd()) handle_udp_event(c_ctx);
+                else if (ctx->fd == tun->get_fd()) handle_tun_event(c_ctx);
             }
         }
     } catch (const std::exception& e) {
-        std::cerr << std::format("[Critical] {}\n", e.what());
-        return EXIT_FAILURE;
+        std::cerr << "[Critical Client Error] " << e.what() << "\n";
+        return 1;
     }
-    return EXIT_SUCCESS;
+
+    std::cout << "[NovaLink] Client shutdown complete.\n";
+    return 0;
 }
