@@ -9,8 +9,6 @@
 * \project NovaLink Vpn
 * * Copyright (c) 2025-2026 Devopstim. All rights reserved.
  *********************************************************************/
-
-
 #pragma once
 #include <string>
 #include <arpa/inet.h>
@@ -18,6 +16,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <format>
+#include <functional>
 
 class NetworkException : public std::runtime_error {
 public:
@@ -62,6 +61,15 @@ struct NetAddress {
         return std::format("{}:{}", ip_str, get_port());
     }
 
+    bool operator==(const NetAddress& other) const noexcept {
+        if (get_port() != other.get_port()) return false;
+        return is_same_ip(other);
+    }
+
+    bool operator!=(const NetAddress& other) const noexcept {
+        return !(*this == other);
+    }
+
     [[nodiscard]] bool is_same_ip(const NetAddress& other) const noexcept {
         if (storage.ss_family == other.storage.ss_family) {
             if (storage.ss_family == AF_INET) {
@@ -98,3 +106,20 @@ private:
     sockaddr_in* get_sin_internal() { return static_cast<sockaddr_in*>(static_cast<void*>(&storage)); }
     sockaddr_in6* get_sin6_internal() { return static_cast<sockaddr_in6*>(static_cast<void*>(&storage)); }
 };
+
+namespace std {
+    template<>
+    struct hash<NetAddress> {
+        size_t operator()(const NetAddress& addr) const noexcept {
+            size_t h = 0;
+            if (addr.storage.ss_family == AF_INET) {
+                h = std::hash<uint32_t>{}(addr.get_sin()->sin_addr.s_addr);
+            } else if (addr.storage.ss_family == AF_INET6) {
+                uint64_t part;
+                std::memcpy(&part, &addr.get_sin6()->sin6_addr, 8);
+                h = std::hash<uint64_t>{}(part);
+            }
+            return h ^ (std::hash<uint16_t>{}(addr.get_port()) << 1);
+        }
+    };
+}
