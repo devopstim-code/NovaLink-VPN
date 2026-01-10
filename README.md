@@ -3,8 +3,11 @@
   <img src="https://img.shields.io/badge/License-APACHE-green?style=for-the-badge" alt="License">
   <img src="https://img.shields.io/badge/Post--Quantum-ML--KEM-red?style=for-the-badge" alt="PQC">
   <img src="https://img.shields.io/badge/Security-Hardened-orange?style=for-the-badge" alt="Security">
-
-  # 🛡️ NovaLink VPN v3.0.1
+  <img src="https://sonarcloud.io/api/project_badges/measure?project=devopstim-code_NovaLink-VPN&metric=alert_status" alt="Quality Gate Status">
+  <img src="https://sonarcloud.io/api/project_badges/measure?project=devopstim-code_NovaLink-VPN&metric=reliability_rating" alt="Reliability Rating">
+  <img src="https://sonarcloud.io/api/project_badges/measure?project=devopstim-code_NovaLink-VPN&metric=security_rating" alt="Security Rating">
+ 
+# 🛡️ NovaLink VPN v3.0.1
   **High-Performance Post-Quantum Hybrid VPN Tunnel**
 </div>
 
