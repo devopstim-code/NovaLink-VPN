@@ -112,7 +112,7 @@ struct NetAddress {
     }
 
     [[nodiscard]] const sockaddr* get_sockaddr() const noexcept {
-        return reinterpret_cast<const sockaddr*>(&storage);
+        return static_cast<const sockaddr*>(static_cast<const void*>(&storage));
     }
 
     [[nodiscard]] uint16_t get_port() const noexcept {
