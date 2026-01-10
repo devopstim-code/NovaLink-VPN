@@ -73,7 +73,12 @@ struct NetAddress {
         if (storage.ss_family != other.storage.ss_family) {
             auto check_mapped = [](const sockaddr_in6* a6, const sockaddr_in* a4) {
                 const uint8_t* addr6 = a6->sin6_addr.s6_addr;
-                bool is_mapped = (std::memcmp(addr6, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff", 12) == 0);
+                static constexpr uint8_t ipv4_mapped_prefix[12] = {
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF
+                };
+
+                bool is_mapped = (std::memcmp(addr6, ipv4_mapped_prefix, 12) == 0);
                 return is_mapped && (std::memcmp(addr6 + 12, &a4->sin_addr.s_addr, 4) == 0);
             };
 
