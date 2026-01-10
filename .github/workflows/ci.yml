@@ -62,3 +62,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          with:
+            args: >
+              -Dsonar.organization=devopstim-code
+              -Dsonar.projectKey=5b0ace17f0d1f47f1bbe3a57e788585e150dd305
+              -Dsonar.sources=core,apps
+              -Dsonar.cpp.std=c++23
+              -Dsonar.cfamily.compile-commands=build/compile_commands.json
