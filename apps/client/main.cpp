@@ -70,7 +70,7 @@ void send_handshake(ClientContext& ctx, uint32_t v_ip) {
     ptr += 4;
 
     auto final_span = SslLayer::wrap_inplace({handshake_buf, Sizes::MTU}, ptr - 5, SslLayer::RECORD_HANDSHAKE);
-    ctx.udp.send(final_span, ctx.server_addr);
+    (void)ctx.udp.send(final_span, ctx.server_addr);
     std::cout << "[UDP] Handshake sent to server..." << std::endl;
 }
 
@@ -150,7 +150,7 @@ void handle_tun_event(ClientContext& ctx) {
         auto final_span = SslLayer::wrap_inplace({tun_buf, Sizes::MTU},
                                                 enc_len + 1 + CryptoEngine::IV_SIZE,
                                                 SslLayer::RECORD_APPLICATION_DATA);
-        ctx.udp.send(final_span, ctx.server_addr);
+       (void)ctx.udp.send(final_span, ctx.server_addr);
     });
 }
 int main(int argc, char* argv[]) {

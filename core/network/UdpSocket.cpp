@@ -33,28 +33,17 @@ UdpSocket& UdpSocket::operator=(UdpSocket&& other) noexcept {
 
 void UdpSocket::bind(uint16_t port, bool ipv6) {
     NetAddress addr(ipv6 ? "::" : "0.0.0.0", port);
-
-    const auto* addr_ptr = static_cast<const struct sockaddr*>(
-        static_cast<const void*>(&addr.storage)
-    );
-
-    if (::bind(_fd, addr_ptr, addr.len) == -1) {
+    if (::bind(_fd, addr.get_sockaddr(), addr.len) == -1) {
         throw std::system_error(errno, std::system_category(), "Failed to bind UDP socket");
     }
 }
 
 ssize_t UdpSocket::send(std::span<const std::byte> data, const NetAddress& dest) const {
-    const auto* addr_ptr = static_cast<const struct sockaddr*>(
-        static_cast<const void*>(&dest.storage)
-    );
-
-    return sendto(_fd, data.data(), data.size(), 0, addr_ptr, dest.len);
+    return sendto(_fd, data.data(), data.size(), 0, dest.get_sockaddr(), dest.len);
 }
 
 ssize_t UdpSocket::receive(std::span<std::byte> buf, NetAddress& out_addr) const {
-    auto* addr_ptr = static_cast<struct sockaddr*>(
-        static_cast<void*>(&out_addr.storage)
-    );
+    auto* addr_ptr = reinterpret_cast<struct sockaddr*>(&out_addr.storage);
     out_addr.len = sizeof(out_addr.storage);
 
     return recvfrom(_fd, buf.data(), buf.size(), 0, addr_ptr, &out_addr.len);

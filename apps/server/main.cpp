@@ -116,7 +116,7 @@ void handle_client_handshake(const NetAddress& sender, std::span<const std::byte
         ans.insert(ans.end(), kyber_ct.begin(), kyber_ct.end());
 
         auto ssl_ans = SslLayer::wrap(ans, SslLayer::RECORD_HANDSHAKE);
-        ctx.udp.send(ssl_ans, sender);
+        (void)ctx.udp.send(ssl_ans, sender);
 
     } catch (const std::exception& e) {
         std::cerr << "[Crypto Error] Handshake failed: " << e.what() << "\n";

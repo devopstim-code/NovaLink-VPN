@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <format>
 #include <functional>
+#include <array>
 
 class NetworkException : public std::runtime_error {
 public:
@@ -31,18 +32,32 @@ struct NetAddress {
         std::memset(&storage, 0, sizeof(storage));
     }
 
+    [[nodiscard]] const sockaddr_in& as_v4() const noexcept {
+        return *static_cast<const sockaddr_in*>(static_cast<const void*>(&storage));
+    }
+
+    [[nodiscard]] const sockaddr_in6& as_v6() const noexcept {
+        return *static_cast<const sockaddr_in6*>(static_cast<const void*>(&storage));
+    }
+
+    [[nodiscard]] sockaddr_in& as_v4_internal() noexcept {
+        return *static_cast<sockaddr_in*>(static_cast<void*>(&storage));
+    }
+
+    [[nodiscard]] sockaddr_in6& as_v6_internal() noexcept {
+        return *static_cast<sockaddr_in6*>(static_cast<void*>(&storage));
+    }
+
     explicit NetAddress(const std::string& ip, uint16_t port) {
         std::memset(&storage, 0, sizeof(storage));
 
-        if (inet_pton(AF_INET, ip.c_str(), &get_sin_internal()->sin_addr) > 0) {
-            auto* sin = get_sin_internal();
-            sin->sin_family = AF_INET;
-            sin->sin_port = htons(port);
+        if (inet_pton(AF_INET, ip.c_str(), &as_v4_internal().sin_addr) > 0) {
+            as_v4_internal().sin_family = AF_INET;
+            as_v4_internal().sin_port = htons(port);
             len = sizeof(sockaddr_in);
-        } else if (inet_pton(AF_INET6, ip.c_str(), &get_sin6_internal()->sin6_addr) > 0) {
-            auto* sin6 = get_sin6_internal();
-            sin6->sin6_family = AF_INET6;
-            sin6->sin6_port = htons(port);
+        } else if (inet_pton(AF_INET6, ip.c_str(), &as_v6_internal().sin6_addr) > 0) {
+            as_v6_internal().sin6_family = AF_INET6;
+            as_v6_internal().sin6_port = htons(port);
             len = sizeof(sockaddr_in6);
         } else {
             throw NetworkException(std::format("Invalid IP format: {}", ip));
@@ -53,9 +68,9 @@ struct NetAddress {
         std::string ip_str(INET6_ADDRSTRLEN, '\0');
 
         if (storage.ss_family == AF_INET) {
-            inet_ntop(AF_INET, &get_sin()->sin_addr, ip_str.data(), INET_ADDRSTRLEN);
+            inet_ntop(AF_INET, &as_v4().sin_addr, ip_str.data(), INET_ADDRSTRLEN);
         } else if (storage.ss_family == AF_INET6) {
-            inet_ntop(AF_INET6, &get_sin6()->sin6_addr, ip_str.data(), INET6_ADDRSTRLEN);
+            inet_ntop(AF_INET6, &as_v6().sin6_addr, ip_str.data(), INET6_ADDRSTRLEN);
         } else {
             return "unknown";
         }
@@ -71,46 +86,38 @@ struct NetAddress {
 
     [[nodiscard]] bool is_same_ip(const NetAddress& other) const noexcept {
         if (storage.ss_family != other.storage.ss_family) {
-            auto check_mapped = [](const sockaddr_in6* a6, const sockaddr_in* a4) {
-                const uint8_t* addr6 = a6->sin6_addr.s6_addr;
-                static constexpr uint8_t ipv4_mapped_prefix[12] = {
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF
+            auto check_mapped = [](const sockaddr_in6& a6, const sockaddr_in& a4) {
+                static constexpr std::array<uint8_t, 12> ipv4_prefix = {
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff
                 };
-
-                bool is_mapped = (std::memcmp(addr6, ipv4_mapped_prefix, 12) == 0);
-                return is_mapped && (std::memcmp(addr6 + 12, &a4->sin_addr.s_addr, 4) == 0);
+                return std::memcmp(a6.sin6_addr.s6_addr, ipv4_prefix.data(), 12) == 0 &&
+                       std::memcmp(a6.sin6_addr.s6_addr + 12, &a4.sin_addr.s_addr, 4) == 0;
             };
 
-            if (storage.ss_family == AF_INET6 && other.storage.ss_family == AF_INET) return check_mapped(get_sin6(), other.get_sin());
-            if (storage.ss_family == AF_INET && other.storage.ss_family == AF_INET6) return check_mapped(other.get_sin6(), get_sin());
+            if (storage.ss_family == AF_INET6 && other.storage.ss_family == AF_INET)
+                return check_mapped(as_v6(), other.as_v4());
+            if (storage.ss_family == AF_INET && other.storage.ss_family == AF_INET6)
+                return check_mapped(other.as_v6(), as_v4());
 
             return false;
         }
 
         if (storage.ss_family == AF_INET) {
-            return get_sin()->sin_addr.s_addr == other.get_sin()->sin_addr.s_addr;
+            return as_v4().sin_addr.s_addr == other.as_v4().sin_addr.s_addr;
         }
-
         if (storage.ss_family == AF_INET6) {
-            return std::memcmp(get_sin6()->sin6_addr.s6_addr, other.get_sin6()->sin6_addr.s6_addr, 16) == 0;
+            return std::memcmp(as_v6().sin6_addr.s6_addr, other.as_v6().sin6_addr.s6_addr, 16) == 0;
         }
-
         return false;
     }
 
-    sockaddr_in* get_sin() { return reinterpret_cast<sockaddr_in*>(&storage); }
-    const sockaddr_in* get_sin() const { return reinterpret_cast<const sockaddr_in*>(&storage); }
-    sockaddr_in6* get_sin6() { return reinterpret_cast<sockaddr_in6*>(&storage); }
-    const sockaddr_in6* get_sin6() const { return reinterpret_cast<const sockaddr_in6*>(&storage); }
-
-    [[nodiscard]] uint16_t get_port() const noexcept {
-        return (storage.ss_family == AF_INET) ? ntohs(get_sin()->sin_port) : ntohs(get_sin6()->sin6_port);
+    [[nodiscard]] const sockaddr* get_sockaddr() const noexcept {
+        return reinterpret_cast<const sockaddr*>(&storage);
     }
 
-private:
-    sockaddr_in* get_sin_internal() { return reinterpret_cast<sockaddr_in*>(&storage); }
-    sockaddr_in6* get_sin6_internal() { return reinterpret_cast<sockaddr_in6*>(&storage); }
+    [[nodiscard]] uint16_t get_port() const noexcept {
+        return (storage.ss_family == AF_INET) ? ntohs(as_v4().sin_port) : ntohs(as_v6().sin6_port);
+    }
 };
 
 namespace std {
@@ -119,10 +126,10 @@ namespace std {
         size_t operator()(const NetAddress& addr) const noexcept {
             size_t h = 0;
             if (addr.storage.ss_family == AF_INET) {
-                h = std::hash<uint32_t>{}(addr.get_sin()->sin_addr.s_addr);
+                h = std::hash<uint32_t>{}(addr.as_v4().sin_addr.s_addr);
             } else if (addr.storage.ss_family == AF_INET6) {
                 uint64_t part;
-                std::memcpy(&part, addr.get_sin6()->sin6_addr.s6_addr, 8);
+                std::memcpy(&part, addr.as_v6().sin6_addr.s6_addr, 8);
                 h = std::hash<uint64_t>{}(part);
             }
             return h ^ (std::hash<uint16_t>{}(addr.get_port()) << 1);
