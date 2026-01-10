@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Post--Quantum-ML--KEM-red?style=for-the-badge" alt="PQC">
   <img src="https://img.shields.io/badge/Security-Hardened-orange?style=for-the-badge" alt="Security">
 
-  # 🛡️ NovaLink VPN v3.0
+  # 🛡️ NovaLink VPN v3.0.1
   **High-Performance Post-Quantum Hybrid VPN Tunnel**
 </div>
 
@@ -13,7 +13,7 @@
 ## 🚀 Overview
 **NovaLink v3.0** is a production-grade Layer 3 VPN implementation engineered in C++23. It addresses the impending threat of quantum computing by implementing a **Hybrid Cryptographic Handshake**, ensuring that captured traffic remains undecipherable even against future large-scale quantum computers.
 
-### 💎 Key Architectural Improvements (v3.0)
+### 💎 Key Architectural Improvements (v3.0.1)
 * **Zero-Allocation Hot-Path**: Packet processing utilizes `thread_local static` arenas, eliminating heap allocations during data transit.
 * **In-Place Cryptography**: Leverages `std::span` for buffer manipulation, reducing memory overhead and cache misses by ~40%.
 * **Hybrid KEM**: Simultaneous **ML-KEM (Kyber-768)** and **X25519** key exchange for NIST-standardized quantum resistance.
